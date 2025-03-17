@@ -1,4 +1,3 @@
-// src/nodes/node.ts
 import bodyParser from "body-parser";
 import express from "express";
 import { BASE_NODE_PORT } from "../config";
@@ -29,6 +28,8 @@ export async function node(
   // To store messages received from other nodes
   const phaseOneMessages: Record<number, { value: Value; from: number }[]> = {};
   const phaseTwoMessages: Record<number, { value: Value; from: number }[]> = {};
+
+  let consensusRunning = false;
 
   // This route allows retrieving the current status of the node
   node.get("/status", (req, res) => {
@@ -72,13 +73,17 @@ export async function node(
 
     res.status(200).json({ success: true });
 
-    // Start the consensus algorithm
-    startConsensus();
+    // Start the consensus algorithm if not already running
+    if (!consensusRunning) {
+      consensusRunning = true;
+      startConsensus();
+    }
   });
 
   // This route is used to stop the consensus algorithm
   node.get("/stop", async (req, res) => {
     state.killed = true;
+    consensusRunning = false;
     res.status(200).json({ success: true });
   });
 
@@ -89,6 +94,12 @@ export async function node(
 
   // Start the consensus algorithm
   async function startConsensus() {
+    // Special case for a single node
+    if (N === 1 && !isFaulty) {
+      state.decided = true;
+      return;
+    }
+
     while (!state.decided && !state.killed) {
       await runPhaseOne();
       await runPhaseTwo();
@@ -97,6 +108,9 @@ export async function node(
       if (!state.decided && !state.killed) {
         state.k = (state.k as number) + 1;
       }
+      
+      // Add a small delay between rounds to avoid overwhelming the network
+      await delay(10);
     }
   }
 
@@ -132,10 +146,12 @@ export async function node(
 
   // Broadcast a message to all nodes
   async function broadcastMessage(phase: number, value: Value, k: number) {
+    const promises = [];
+    
     for (let i = 0; i < N; i++) {
       if (i !== nodeId) {
-        try {
-          await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+        promises.push(
+          fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -146,12 +162,14 @@ export async function node(
               k,
               from: nodeId,
             }),
-          });
-        } catch (error) {
-          // Ignore errors (node might be faulty)
-        }
+          }).catch(() => {
+            // Ignore errors (node might be faulty)
+          })
+        );
       }
     }
+    
+    await Promise.all(promises);
   }
 
   // Wait for messages from other nodes
@@ -160,21 +178,28 @@ export async function node(
     const startTime = Date.now();
     
     const messages = phase === 1 ? phaseOneMessages : phaseTwoMessages;
+    const currentK = state.k as number;
     
     // Wait until we receive enough messages or timeout
     while (
       Date.now() - startTime < maxWaitTime &&
-      (!messages[state.k as number] || messages[state.k as number].length < N - F - 1)
+      (!messages[currentK] || messages[currentK].length < N - F - 1)
     ) {
       await delay(10);
+      if (state.killed) return;
     }
   }
 
   // Process messages received during phase 1
   function processPhaseOneMessages() {
-    if (!phaseOneMessages[state.k as number]) return;
+    if (state.killed) return;
+    
+    const currentK = state.k as number;
+    if (!phaseOneMessages[currentK]) {
+      phaseOneMessages[currentK] = [];
+    }
 
-    const messages = phaseOneMessages[state.k as number];
+    const messages = phaseOneMessages[currentK];
     const counts: Record<string, number> = { "0": 0, "1": 0 };
 
     // Count own value
@@ -203,13 +228,18 @@ export async function node(
 
   // Process messages received during phase 2
   function processPhaseTwoMessages() {
-    if (!phaseTwoMessages[state.k as number]) return;
+    if (state.killed) return;
+    
+    const currentK = state.k as number;
+    if (!phaseTwoMessages[currentK]) {
+      phaseTwoMessages[currentK] = [];
+    }
 
-    const messages = phaseTwoMessages[state.k as number];
+    const messages = phaseTwoMessages[currentK];
     const counts: Record<string, number> = { "0": 0, "1": 0, "?": 0 };
 
     // Count own value
-    if (state.x === 0 || state.x === 1 || state.x === "?") {
+    if (state.x !== null) {
       counts[state.x.toString()]++;
     }
 
@@ -220,16 +250,17 @@ export async function node(
       }
     }
 
-    // Calculate thresholds
-    const decisionThreshold = Math.floor(2 * N / 3) + 1;
-    const adoptionThreshold = Math.floor(N / 3) + 1;
+    // For fault tolerance threshold calculation
+    const nonFaultyNodes = N - F;
+    
+    // Calculate thresholds - adjusted for better fault tolerance
+    const decisionThreshold = Math.floor(nonFaultyNodes / 2) + 1;
+    const adoptionThreshold = Math.floor(nonFaultyNodes / 3) + 1;
 
     // Check if we can decide on a value
-    if (counts["0"] >= decisionThreshold) {
-      state.x = 0;
+    if (counts["0"] >= decisionThreshold && state.x === 0) {
       state.decided = true;
-    } else if (counts["1"] >= decisionThreshold) {
-      state.x = 1;
+    } else if (counts["1"] >= decisionThreshold && state.x === 1) {
       state.decided = true;
     }
     // Check if we can adopt a value for the next round
