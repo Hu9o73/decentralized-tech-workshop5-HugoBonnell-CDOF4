@@ -1,7 +1,9 @@
+// src/nodes/node.ts
 import bodyParser from "body-parser";
 import express from "express";
 import { BASE_NODE_PORT } from "../config";
 import { Value } from "../types";
+import { delay } from "../utils";
 
 export async function node(
   nodeId: number, // the ID of the node
@@ -16,25 +18,230 @@ export async function node(
   node.use(express.json());
   node.use(bodyParser.json());
 
-  // TODO implement this
-  // this route allows retrieving the current status of the node
-  // node.get("/status", (req, res) => {});
+  // Node state
+  const state = {
+    killed: false,
+    x: isFaulty ? null : initialValue,
+    decided: isFaulty ? null : false,
+    k: isFaulty ? null : 0,
+  };
 
-  // TODO implement this
-  // this route allows the node to receive messages from other nodes
-  // node.post("/message", (req, res) => {});
+  // To store messages received from other nodes
+  const phaseOneMessages: Record<number, { value: Value; from: number }[]> = {};
+  const phaseTwoMessages: Record<number, { value: Value; from: number }[]> = {};
 
-  // TODO implement this
-  // this route is used to start the consensus algorithm
-  // node.get("/start", async (req, res) => {});
+  // This route allows retrieving the current status of the node
+  node.get("/status", (req, res) => {
+    if (isFaulty) {
+      res.status(500).send("faulty");
+    } else {
+      res.status(200).send("live");
+    }
+  });
 
-  // TODO implement this
-  // this route is used to stop the consensus algorithm
-  // node.get("/stop", async (req, res) => {});
+  // This route allows the node to receive messages from other nodes
+  node.post("/message", (req, res) => {
+    if (state.killed || isFaulty) {
+      res.status(500).json({ error: "Node is dead or faulty" });
+      return;
+    }
 
-  // TODO implement this
-  // get the current state of a node
-  // node.get("/getState", (req, res) => {});
+    const { phase, value, k, from } = req.body;
+
+    if (phase === 1) {
+      if (!phaseOneMessages[k]) {
+        phaseOneMessages[k] = [];
+      }
+      phaseOneMessages[k].push({ value, from });
+    } else if (phase === 2) {
+      if (!phaseTwoMessages[k]) {
+        phaseTwoMessages[k] = [];
+      }
+      phaseTwoMessages[k].push({ value, from });
+    }
+
+    res.status(200).json({ success: true });
+  });
+
+  // This route is used to start the consensus algorithm
+  node.get("/start", async (req, res) => {
+    if (isFaulty || state.killed) {
+      res.status(500).json({ error: "Node is faulty or killed" });
+      return;
+    }
+
+    res.status(200).json({ success: true });
+
+    // Start the consensus algorithm
+    startConsensus();
+  });
+
+  // This route is used to stop the consensus algorithm
+  node.get("/stop", async (req, res) => {
+    state.killed = true;
+    res.status(200).json({ success: true });
+  });
+
+  // Get the current state of a node
+  node.get("/getState", (req, res) => {
+    res.status(200).json(state);
+  });
+
+  // Start the consensus algorithm
+  async function startConsensus() {
+    while (!state.decided && !state.killed) {
+      await runPhaseOne();
+      await runPhaseTwo();
+      
+      // Move to the next round
+      if (!state.decided && !state.killed) {
+        state.k = (state.k as number) + 1;
+      }
+    }
+  }
+
+  // Phase 1 of the Ben-Or algorithm
+  async function runPhaseOne() {
+    // Skip if the node is killed or has already decided
+    if (state.killed || state.decided) return;
+
+    // Broadcast current value to all nodes
+    await broadcastMessage(1, state.x as Value, state.k as number);
+
+    // Wait for messages from other nodes
+    await waitForMessages(1);
+
+    // Process received messages
+    processPhaseOneMessages();
+  }
+
+  // Phase 2 of the Ben-Or algorithm
+  async function runPhaseTwo() {
+    // Skip if the node is killed or has already decided
+    if (state.killed || state.decided) return;
+
+    // Broadcast current value to all nodes
+    await broadcastMessage(2, state.x as Value, state.k as number);
+
+    // Wait for messages from other nodes
+    await waitForMessages(2);
+
+    // Process received messages
+    processPhaseTwoMessages();
+  }
+
+  // Broadcast a message to all nodes
+  async function broadcastMessage(phase: number, value: Value, k: number) {
+    for (let i = 0; i < N; i++) {
+      if (i !== nodeId) {
+        try {
+          await fetch(`http://localhost:${BASE_NODE_PORT + i}/message`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              phase,
+              value,
+              k,
+              from: nodeId,
+            }),
+          });
+        } catch (error) {
+          // Ignore errors (node might be faulty)
+        }
+      }
+    }
+  }
+
+  // Wait for messages from other nodes
+  async function waitForMessages(phase: number) {
+    const maxWaitTime = 200; // ms
+    const startTime = Date.now();
+    
+    const messages = phase === 1 ? phaseOneMessages : phaseTwoMessages;
+    
+    // Wait until we receive enough messages or timeout
+    while (
+      Date.now() - startTime < maxWaitTime &&
+      (!messages[state.k as number] || messages[state.k as number].length < N - F - 1)
+    ) {
+      await delay(10);
+    }
+  }
+
+  // Process messages received during phase 1
+  function processPhaseOneMessages() {
+    if (!phaseOneMessages[state.k as number]) return;
+
+    const messages = phaseOneMessages[state.k as number];
+    const counts: Record<string, number> = { "0": 0, "1": 0 };
+
+    // Count own value
+    if (state.x === 0 || state.x === 1) {
+      counts[state.x.toString()]++;
+    }
+
+    // Count received values
+    for (const msg of messages) {
+      if (msg.value === 0 || msg.value === 1) {
+        counts[msg.value.toString()]++;
+      }
+    }
+
+    // Check if there's a majority (more than N/2)
+    const majority = Math.floor(N / 2) + 1;
+    
+    if (counts["0"] >= majority) {
+      state.x = 0;
+    } else if (counts["1"] >= majority) {
+      state.x = 1;
+    } else {
+      state.x = "?";
+    }
+  }
+
+  // Process messages received during phase 2
+  function processPhaseTwoMessages() {
+    if (!phaseTwoMessages[state.k as number]) return;
+
+    const messages = phaseTwoMessages[state.k as number];
+    const counts: Record<string, number> = { "0": 0, "1": 0, "?": 0 };
+
+    // Count own value
+    if (state.x === 0 || state.x === 1 || state.x === "?") {
+      counts[state.x.toString()]++;
+    }
+
+    // Count received values
+    for (const msg of messages) {
+      if (msg.value === 0 || msg.value === 1 || msg.value === "?") {
+        counts[msg.value.toString()]++;
+      }
+    }
+
+    // Calculate thresholds
+    const decisionThreshold = Math.floor(2 * N / 3) + 1;
+    const adoptionThreshold = Math.floor(N / 3) + 1;
+
+    // Check if we can decide on a value
+    if (counts["0"] >= decisionThreshold) {
+      state.x = 0;
+      state.decided = true;
+    } else if (counts["1"] >= decisionThreshold) {
+      state.x = 1;
+      state.decided = true;
+    }
+    // Check if we can adopt a value for the next round
+    else if (counts["0"] >= adoptionThreshold) {
+      state.x = 0;
+    } else if (counts["1"] >= adoptionThreshold) {
+      state.x = 1;
+    } else {
+      // Choose randomly between 0 and 1
+      state.x = Math.random() < 0.5 ? 0 : 1;
+    }
+  }
 
   // start the server
   const server = node.listen(BASE_NODE_PORT + nodeId, async () => {
